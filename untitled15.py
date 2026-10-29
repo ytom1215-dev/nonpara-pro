@@ -4,8 +4,8 @@ import io
 from scipy import stats
 import scikit_posthocs as sp
 import plotly.express as px
-import plotly.graph_objects as go
 
+# ページ設定
 st.set_page_config(page_title="ノンパラ検定アプリ", layout="wide")
 st.title("🌾 ノンパラメトリック検定 & 多重比較アプリ")
 
@@ -32,13 +32,13 @@ SAMPLE_DATA = (
     "C肥料\t2"
 )
 
-# ── session_state 初期化（text_area と競合しない形で管理）──────────────────────
-# text_area の key を使わず、別キーでサンプル読込フラグを管理する
-if "load_sample_trigger" not in st.session_state:
-    st.session_state.load_sample_trigger = False
+# ── session_state 初期化 ──────────────────────────────────────────────────────
+# text_area の key に直接連動させることで、確実に入力欄を書き換えます
+if "input_data" not in st.session_state:
+    st.session_state.input_data = ""
 
 def load_sample():
-    st.session_state.load_sample_trigger = True
+    st.session_state.input_data = SAMPLE_DATA
 
 # ── タブ構成 ───────────────────────────────────────────────────────────────────
 tab1, tab2 = st.tabs(["📊 データ分析ツール", "📖 ノンパラ検定とは？（農業向け解説）"])
@@ -52,10 +52,10 @@ with tab1:
 
     st.button("🌱 農業のサンプルデータを読み込む", on_click=load_sample)
 
-    default_text = SAMPLE_DATA if st.session_state.load_sample_trigger else ""
+    # key="input_data" を指定し、セッションステートと連動
     paste_data = st.text_area(
         "ここにExcelのデータを貼り付けてください",
-        value=default_text,
+        key="input_data",
         height=200,
         placeholder="群\t数値\nA肥料\t1\nA肥料\t2...",
     )
@@ -63,9 +63,11 @@ with tab1:
     if paste_data.strip():
         try:
             # ── データ読み込み ─────────────────────────────────────────────────
+            # まずタブ区切りで試す
             df = pd.read_csv(io.StringIO(paste_data), sep="\t")
             if len(df.columns) < 2:
-                df = pd.read_csv(io.StringIO(paste_data), sep=r"\s+")
+                # タブ区切りでダメなら空白区切りでリトライ
+                df = pd.read_csv(io.StringIO(paste_data), sep=r"\s+", engine="python")
 
             st.write("### 読み込まれたデータ（先頭5行）")
             st.dataframe(df.head())
@@ -94,6 +96,7 @@ with tab1:
                 # ── 前処理 ────────────────────────────────────────────────────
                 clean_df = df[[group_col, value_col]].copy()
                 n_before = len(clean_df)
+                # 数値列に変換（文字列などが混ざっていたらNaNにする）
                 clean_df[value_col] = pd.to_numeric(clean_df[value_col], errors="coerce")
                 clean_df = clean_df.dropna()
                 n_after = len(clean_df)
@@ -142,17 +145,15 @@ with tab1:
 
                     # ── 事後検定（Steel-Dwass）+ CLD ──────────────────────────
                     if overall_p_val < 0.05:
-                        posthoc_df = sp.posthoc_dscf(
-                            clean_df, val_col=value_col, group_col=group_col
-                        )
-                        # 0.14.0: compact_letter_display は pd.Series を返す
-                        # 文字列にパディングが含まれるため strip() が必須
                         try:
+                            posthoc_df = sp.posthoc_dscf(
+                                clean_df, val_col=value_col, group_col=group_col
+                            )
                             cld_series = sp.compact_letter_display(
                                 posthoc_df, alpha=0.05
                             ).str.strip()
                         except Exception as e:
-                            st.warning(f"CLD の計算中にエラーが発生しました: {e}")
+                            st.warning(f"多重比較（事後検定）の計算中にエラーが発生しました: {e}")
 
                 # ── グラフ ────────────────────────────────────────────────────
                 st.write("### 📈 データの分布と検定結果")
@@ -202,16 +203,18 @@ with tab1:
                     if num_groups == 2:
                         n_total = sum(len(g) for g in group_data)
                         if paired == "対応あり":
-                            z = stats.norm.ppf(overall_p_val / 2)
+                            # p値が1.0の場合などのゼロ除算や無限大エラーを回避
+                            p_val_adj = max(overall_p_val, 1e-15)
+                            z = stats.norm.ppf(p_val_adj / 2)
                         else:
                             z_stat, _ = stats.mannwhitneyu(
                                 group_data[0], group_data[1], alternative="two-sided"
                             )
-                            # U → Z 変換
                             n1, n2 = len(group_data[0]), len(group_data[1])
                             mu = n1 * n2 / 2
                             sigma = ((n1 * n2 * (n1 + n2 + 1)) / 12) ** 0.5
-                            z = (z_stat - mu) / sigma
+                            z = (z_stat - mu) / sigma if sigma > 0 else 0
+                            
                         r = abs(z) / (n_total ** 0.5)
                         st.metric("効果量 r", f"{r:.3f}", help="|r| : 0.1=小, 0.3=中, 0.5=大")
 
@@ -219,14 +222,18 @@ with tab1:
                     st.success("🌟 5%水準で有意な差があります。")
                     if num_groups > 2 and posthoc_df is not None:
                         st.write("#### 🔗 Steel-Dwass 検定（総当たり p 値マトリックス）")
-                        # 有意ペアをハイライト
+                        
                         def highlight_sig(val):
                             if isinstance(val, float) and val < 0.05 and val != 1.0:
                                 return "background-color: #ffe0e0; font-weight: bold"
                             return ""
-                        st.dataframe(
-                            posthoc_df.style.format("{:.4f}").applymap(highlight_sig)
-                        )
+
+                        # Pandas 2.1 以降でのエラー対策（applymap は map に変更された）
+                        styled_df = posthoc_df.style.format("{:.4f}")
+                        if hasattr(styled_df, "map"):
+                            st.dataframe(styled_df.map(highlight_sig))
+                        else:
+                            st.dataframe(styled_df.applymap(highlight_sig))
 
                         if not cld_series.empty:
                             st.write("#### 🔤 Compact Letter Display (CLD)")
