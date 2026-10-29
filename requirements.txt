@@ -1,6 +1,7 @@
 streamlit
-starlette<1.0.0⁠
+starlette<1.0.0
 pandas
 scipy
 scikit-posthocs==0.14.0
 plotly
+
